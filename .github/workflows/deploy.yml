@@ -1,0 +1,151 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  DEPLOY_PATH: /opt/booksocial
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            set -e
+
+            # Setup deployment directory
+            if [ ! -d "${{ env.DEPLOY_PATH }}/.git" ]; then
+              echo "📥 Setting up repository for the first time..."
+              sudo rm -rf ${{ env.DEPLOY_PATH }}
+              sudo mkdir -p $(dirname ${{ env.DEPLOY_PATH }})
+              git clone https://github.com/${{ github.repository }}.git ${{ env.DEPLOY_PATH }}
+              sudo chown -R $USER:$USER ${{ env.DEPLOY_PATH }}
+            else
+              echo "📥 Pulling latest code from GitHub..."
+              cd ${{ env.DEPLOY_PATH }}
+              git fetch origin
+              git reset --hard origin/main
+            fi
+
+            # Navigate to deployment directory
+            cd ${{ env.DEPLOY_PATH }}
+
+            # Determine Docker Compose command
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE="docker compose"
+            else
+              COMPOSE="docker-compose"
+            fi
+
+            # Create necessary directories
+            mkdir -p uploads logs
+
+            # Create .env file from secrets
+            echo "⚙️ Configuring environment variables..."
+            cat > .env << 'EOF'
+            # Database Configuration
+            MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}
+            MYSQL_DATABASE=${{ secrets.MYSQL_DATABASE }}
+            MYSQL_USER=${{ secrets.MYSQL_USER }}
+            MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
+
+            # Spring Application Configuration
+            SPRING_DATASOURCE_URL=jdbc:mysql://db:3306/${{ secrets.MYSQL_DATABASE }}
+            SPRING_DATASOURCE_USERNAME=${{ secrets.MYSQL_USER }}
+            SPRING_DATASOURCE_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
+
+            # JWT Configuration
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+
+            # Admin Configuration
+            ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL }}
+            ADMIN_PASS=${{ secrets.ADMIN_PASS }}
+
+            # Email Configuration
+            SPRING_MAIL_USERNAME=${{ secrets.SPRING_MAIL_USERNAME }}
+            SPRING_MAIL_PASSWORD=${{ secrets.SPRING_MAIL_PASSWORD }}
+
+            # Frontend URL
+            SPRING_FRONTEND_URL=${{ secrets.SPRING_FRONTEND_URL }}
+
+            # Payment Configuration
+            STRIPE_API_KEY=${{ secrets.STRIPE_API_KEY }}
+            PAYPAL_CLIENT_ID=${{ secrets.PAYPAL_CLIENT_ID }}
+            PAYPAL_CLIENT_SECRET=${{ secrets.PAYPAL_CLIENT_SECRET }}
+            PAYPAL_BASE_URL=${{ secrets.PAYPAL_BASE_URL }}
+
+            # NSFW Detector Configuration
+            NSFW_DETECTOR_ENABLED=${{ secrets.NSFW_DETECTOR_ENABLED }}
+            NSFW_DETECTOR_URL=${{ secrets.NSFW_DETECTOR_URL }}
+            EOF
+
+            # Stop and clean up old containers
+            echo "🛑 Stopping existing containers..."
+            $COMPOSE down || true
+            docker rm -f booksocial-app booksocial-db 2>/dev/null || true
+            docker rmi booksocial-app:latest 2>/dev/null || true
+
+            # Build and deploy with docker-compose
+            echo "🔨 Building Docker image..."
+            $COMPOSE build --no-cache
+
+            echo "🚀 Deploying application..."
+            $COMPOSE up -d --force-recreate
+
+            # Wait for application to start
+            echo "⏳ Waiting for application to start..."
+            sleep 15
+
+            # Check container status
+            echo "📊 Container status:"
+            $COMPOSE ps
+
+            # Show recent logs
+            echo "📝 Recent application logs:"
+            $COMPOSE logs --tail=50 app
+
+            # Cleanup old images
+            echo "🧹 Cleaning up old Docker images..."
+            docker image prune -f
+
+            echo "✅ Deployment completed successfully!"
+
+      - name: Health check
+        run: |
+          echo "🏥 Performing health check..."
+          echo "⏳ Waiting for application to fully start..."
+          sleep 60
+
+          for i in {1..10}; do
+            # Try domain first, fallback to IP
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.VPS_HOST }}:8181/actuator/health || curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.VPS_HOST }}/actuator/health || echo "000")
+            
+            if [ "$response" = "200" ]; then
+              echo "✅ Health check passed!"
+              echo "🚀 Application is running at: http://${{ secrets.VPS_HOST }}:8181"
+              exit 0
+            fi
+            
+            echo "⏳ Attempt $i/10: Health check returned $response, retrying in 15s..."
+            sleep 15
+          done
+
+          echo "❌ Health check failed after 10 attempts"
+          echo "Please check logs: ssh ${{ secrets.VPS_USERNAME }}@${{ secrets.VPS_HOST }} 'cd /opt/booksocial && docker compose logs app'"
+          exit 1

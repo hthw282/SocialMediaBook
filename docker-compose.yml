@@ -1,0 +1,51 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: booksocial-app:latest
+    container_name: booksocial-app
+    ports:
+      - "8181:8181"
+    env_file: .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - booksocial-network
+
+  db:
+    image: mysql:8.4
+    container_name: booksocial-db
+    env_file: .env
+    ports:
+      - "3306:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # Lưu ý: mysqladmin ping cần mật khẩu viết liền sau -p (không có dấu cách)
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u${MYSQL_USER} -p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - booksocial-network
+
+volumes:
+  db-data:
+
+networks:
+  booksocial-network:
+    driver: bridge
